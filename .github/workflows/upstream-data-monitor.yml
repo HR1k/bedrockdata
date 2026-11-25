@@ -2,7 +2,7 @@ name: BedrockData upstream monitor
 
 on:
   schedule:
-    - cron: '17 10 1 * *'
+    - cron: '17 10 1,16 * *'
   workflow_dispatch:
 
 permissions:

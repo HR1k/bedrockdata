@@ -1,0 +1,68 @@
+name: BedrockData upstream monitor
+
+on:
+  schedule:
+    - cron: '17 */6 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  compare:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Compare upstream data manifests (read only)
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import json, os, re, urllib.request
+          from collections import Counter
+
+          def fetch(repo, path):
+              req = urllib.request.Request(
+                  f"https://api.github.com/repos/{repo}/{path}",
+                  headers={"Authorization": "Bearer " + os.environ["GH_TOKEN"],
+                           "Accept": "application/vnd.github+json",
+                           "X-GitHub-Api-Version": "2022-11-28"})
+              with urllib.request.urlopen(req, timeout=30) as response:
+                  return json.load(response)
+
+          def manifest(repo):
+              commit = fetch(repo, "commits/master")
+              sha = commit["sha"]
+              tree = fetch(repo, "git/trees/" + commit["commit"]["tree"]["sha"] + "?recursive=1")
+              if tree.get("truncated"):
+                  raise RuntimeError("Incomplete tree; manual review required")
+              files = {x["path"]: x["sha"] for x in tree["tree"] if x["type"] == "blob"}
+              import base64
+              info = fetch(repo, "contents/protocol_info.json?ref=" + sha)
+              version = json.loads(base64.b64decode(info["content"]))["version"]
+              return sha, files, version
+
+          local_sha, local, current = manifest(os.environ["GITHUB_REPOSITORY"])
+          upstream_sha, upstream, offered = manifest("axolotl-pm/BedrockData")
+          def data(path):
+              return path.endswith((".json", ".nbt", ".bin")) and path != "composer.json" and not path.startswith(".")
+          local = {k:v for k,v in local.items() if data(k)}
+          upstream = {k:v for k,v in upstream.items() if data(k)}
+          changed = sorted(k for k in local.keys() & upstream.keys() if local[k] != upstream[k])
+          added = sorted(upstream.keys() - local.keys())
+          preserved = sorted(local.keys() - upstream.keys())
+          lines = ["# BedrockData comparison (no imports)",
+                   f"- NG fork: `{local_sha}` / protocol {current['protocol_version']}",
+                   f"- Axolotl: `{upstream_sha}` / protocol {offered['protocol_version']}",
+                   "- New upstream protocol: " + ("yes" if offered["protocol_version"] > current["protocol_version"] else "no"),
+                   "- Differences are candidates for manual review, not proof of compatibility.",
+                   "- Existing NG files are preserved; no writes, merges or deployments."]
+          for label, paths in [("Changed shared data", changed), ("Upstream-only data", added), ("NG-only data (preserve)", preserved)]:
+              lines += ["", f"## {label} ({len(paths)})"]
+              lines += ["- `" + re.sub(r"[^a-zA-Z0-9_./+-]", "?", p) + "`" for p in paths]
+          report = "\n".join(lines) + "\n"
+          print(report)
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as f:
+              f.write(report)
+          PY
